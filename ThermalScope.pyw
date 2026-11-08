@@ -4,12 +4,13 @@ ThermalScope - UNI-T / Guide termal kamera goruntuleyici (Windows / Linux)
 
 Mobil "Thermal Mobile" uygulamasinin yaptigini PC'de yapar:
   * UVC kamerasinin 256x384 YUY2 akisini acar (Windows Kamera uygulamasinin
-    gri gordugu akis), icindeki 16-bit radyometrik veriyi cozer,
+    gri gordugu akis), alt yarisindaki 16-bit sicaklik verisini (Kelvin x 64) cozer,
   * palet + otomatik olcek (AGC) ile renkli termal goruntu uretir,
   * imlec/maks/min/merkez/ortalama sicakliklarini gosterir,
   * kalibrasyon ve fotograf kaydetme sunar.
 
 Veri yolu: ffmpeg (Windows: DirectShow, Linux: V4L2) -> raw YUY2 -> numpy -> QImage.
+Istege bagli: uti_uvc.py + libusb1 ile dogrudan USB (kalibrasyon/vendor komutlari icin).
 
 Temiz mod (panel gizli): pencere termal goruntunun en-boy oranina kilitlenir.
 Windows'ta WM_SIZING ile surukleme sirasinda oran korunur; kenardan cekince
@@ -31,9 +32,10 @@ import sys
 import tempfile
 import threading
 import time
-from dataclasses import dataclass, asdict
+from dataclasses import dataclass, asdict, field
 from datetime import datetime
 from pathlib import Path
+from typing import Iterable, List, Sequence, Tuple
 
 try:
     from ctypes import wintypes
@@ -50,8 +52,18 @@ from PySide6.QtWidgets import (
     QAbstractSpinBox,
 )
 
+# Dogrudan USB (libusb) yolu - istege bagli: pip install libusb1  (+ uti_uvc.py, uti256_usb.py)
+try:
+    from uti_uvc import UsbCapture, list_uvc_devices
+except Exception:  # pragma: no cover
+    UsbCapture = None
+
+    def list_uvc_devices(*_args, **_kwargs):
+        return []
+
+
 APP_NAME = "ThermalScope"
-APP_VERSION = "1.0.4"
+APP_VERSION = "1.0.5"
 APP_AUTHOR = "efek0349"
 GITHUB_URL = "https://github.com/efek0349"
 TELEGRAM_URL = "https://t.me/efek0349"
@@ -337,8 +349,128 @@ def install_desktop_entry() -> Path:
 STREAM_W, STREAM_H = 256, 384          # packed 16-bit layout (two 256x192 planes)
 SENSOR_W, SENSOR_H = 256, 192
 ZOOM = 3                                # display magnification
-DEFAULT_SCALE = 1.0 / 1024.0            # degC per count (measured)
-DEFAULT_OFFSET = 2.359375               # degC at raw 18064
+# Alt yarı: 16-bit küçük-endian, Kelvin x 64  ->  T(°C) = ham/64 - 273.15  (donanımda doğrulandı)
+DEFAULT_SCALE = 1.0 / 64.0              # degC per count
+DEFAULT_OFFSET = -273.15                # degC at raw 0
+
+
+# ----------------------------------------------------------------------------
+# parçalı doğrusal sıcaklık kalibrasyonu (thermal_calibration.py ile aynı)
+# ----------------------------------------------------------------------------
+
+# Uygulamadaki parça sınırları (MainActivity.genCalibrationValue)
+SEGMENT_EDGES = [(-np.inf, 0.0), (0.0, 80.0), (80.0, 150.0), (150.0, np.inf)]
+SEGMENT_NAMES = ["<=0 °C", "0-80 °C", "80-150 °C", ">150 °C"]
+
+BOUNDARY_MARGIN = 10.0   # sınıra yakın noktalar komşu parçaya da katkı verir
+MIN_SPREAD = 5.0         # regresyon için noktalar arası asgari sıcaklık farkı (°C)
+K_MIN, K_MAX = 0.8, 1.25
+
+Point = Tuple[float, float]   # (ölçülen °C, gerçek °C)
+Coef = Tuple[float, float]    # (k, b)
+
+
+def fit_line(points: Sequence[Point]) -> Coef:
+    """Uygulamadaki UTi120_cal_Method ile aynı en küçük kareler çözümü.
+    x = ölçülen, y = gerçek.  Tek nokta -> (1, fark)."""
+    n = len(points)
+    if n == 0:
+        return 1.0, 0.0
+    xs = np.array([p[0] for p in points], dtype=np.float64)
+    ys = np.array([p[1] for p in points], dtype=np.float64)
+    if n == 1:
+        return 1.0, float(ys[0] - xs[0])
+    mx, my = xs.mean(), ys.mean()
+    denom = float(((xs - mx) ** 2).sum())
+    if denom < 1e-9:
+        return 1.0, float(my - mx)
+    k = float(((xs - mx) * (ys - my)).sum() / denom)
+    return k, float(my - k * mx)
+
+
+def _offset_only(points: Sequence[Point]) -> Coef:
+    d = [t - m for m, t in points]
+    return 1.0, float(np.mean(d)) if d else 0.0
+
+
+def _safe_fit(points: Sequence[Point]) -> Coef:
+    """Regresyon yap; nokta yetersiz/aralık dar/eğim mantıksızsa ofset düzeltmesine düş."""
+    if len(points) < 2:
+        return _offset_only(points)
+    spread = max(p[0] for p in points) - min(p[0] for p in points)
+    if spread < MIN_SPREAD:
+        return _offset_only(points)
+    k, b = fit_line(points)
+    if not (K_MIN <= k <= K_MAX):
+        return _offset_only(points)
+    return k, b
+
+
+class PiecewiseCalibration:
+    def __init__(self, points: Iterable[Point] | None = None) -> None:
+        self.points: List[Point] = [(float(m), float(t)) for m, t in (points or [])]
+        self.coefs: List[Coef] = [(1.0, 0.0)] * 4
+        self.fit()
+
+    # -- kalıcılık ------------------------------------------------------
+    @classmethod
+    def from_settings(cls, raw) -> "PiecewiseCalibration":
+        pts: List[Point] = []
+        try:
+            for item in raw or []:
+                pts.append((float(item[0]), float(item[1])))
+        except Exception:
+            pts = []
+        return cls(pts)
+
+    def to_settings(self) -> list:
+        return [[m, t] for m, t in self.points]
+
+    # -- model ----------------------------------------------------------
+    @property
+    def active(self) -> bool:
+        return len(self.points) > 0
+
+    def set_points(self, points: Iterable[Point]) -> None:
+        self.points = [(float(m), float(t)) for m, t in points]
+        self.fit()
+
+    def fit(self) -> None:
+        if not self.points:
+            self.coefs = [(1.0, 0.0)] * 4
+            return
+        global_coef = _safe_fit(self.points)
+        coefs: List[Coef] = []
+        for lo, hi in SEGMENT_EDGES:
+            sel = [p for p in self.points
+                   if lo - BOUNDARY_MARGIN <= p[0] <= hi + BOUNDARY_MARGIN]
+            if len(sel) >= 2:
+                coefs.append(_safe_fit(sel))
+            else:
+                coefs.append(global_coef)
+        self.coefs = coefs
+
+    def correct(self, temps):
+        """Sıcaklık dizisini (numpy) ya da tek değeri düzeltir."""
+        if not self.active:
+            return temps
+        t = np.asarray(temps, dtype=np.float32)
+        out = t.copy()
+        for (lo, hi), (k, b) in zip(SEGMENT_EDGES, self.coefs):
+            mask = (t > lo) & (t <= hi) if np.isfinite(lo) else (t <= hi)
+            if not np.isfinite(hi):
+                mask = t > lo
+            out = np.where(mask, k * t + b, out)
+        if np.ndim(temps) == 0:
+            return float(out)
+        return out.astype(np.float32)
+
+    def describe(self) -> str:
+        if not self.active:
+            return "Kalibrasyon: yok"
+        parts = [f"{n}: k={k:.3f} b={b:+.2f}"
+                 for n, (k, b) in zip(SEGMENT_NAMES, self.coefs)]
+        return f"Kalibrasyon ({len(self.points)} nokta) — " + " | ".join(parts)
 
 
 # ----------------------------------------------------------------------------
@@ -363,6 +495,8 @@ class Settings:
     rotation: int = 0
     mirror_h: bool = False
     mirror_v: bool = False
+    cal_points: list = field(default_factory=list)   # [[ölçülen °C, gerçek °C], ...]
+    decode_v: int = 0                                 # 2 = doğru (alt yarı) çözümleme
 
     @staticmethod
     def load() -> "Settings":
@@ -634,8 +768,10 @@ class Capture(threading.Thread):
                 break
 
             plane = np.frombuffer(bytes(buf), dtype=np.uint8).reshape(STREAM_H, STREAM_W, 2)
-            hi = plane[0:SENSOR_H, :, 0].astype(np.uint16)
+            # alt yarı (satır 192-383): kanal0 = düşük bayt, kanal1 = yüksek bayt (Kelvin x 64)
+            # üst yarı kameranın kendi 8-bit görüntüsüdür; sıcaklık için kullanılmaz.
             lo = plane[SENSOR_H:STREAM_H, :, 0].astype(np.uint16)
+            hi = plane[SENSOR_H:STREAM_H, :, 1].astype(np.uint16)
             raw = (hi << 8) | lo
 
             with self.lock:
@@ -1228,14 +1364,15 @@ class ThermalView(QWidget):
 # ----------------------------------------------------------------------------
 
 class CalibrationDialog(QDialog):
-    def __init__(self, parent, scale: float, offset: float, raw_getter):
+    """Noktalar (ölçülen °C, gerçek °C) olarak saklanır; açılışta otomatik uygulanır."""
+
+    def __init__(self, parent, points, temp_getter):
         super().__init__(parent)
         self.setWindowTitle("Sıcaklık kalibrasyonu")
-        self.resize(420, 460)
-        self.scale = scale
-        self.offset = offset
-        self.raw_getter = raw_getter
-        self.points: list[tuple[float, float]] = []
+        self.resize(460, 520)
+        self.temp_getter = temp_getter
+        self.points: list[tuple[float, float]] = [(float(m), float(t)) for m, t in points]
+        self.result_points: list[tuple[float, float]] | None = None
 
         self.live = QLabel("—")
         self.live.setFont(QFont(UI_FONT, 13, QFont.Bold))
@@ -1246,82 +1383,82 @@ class CalibrationDialog(QDialog):
         self.temp.setSuffix(" °C")
         add = QPushButton("Noktayı ekle")
         add.clicked.connect(self.add_point)
+        remove = QPushButton("Seçiliyi sil")
+        remove.clicked.connect(self.remove_point)
         self.list = QListWidget()
-        apply_btn = QPushButton("Uygula")
+        apply_btn = QPushButton("Kaydet ve uygula")
         apply_btn.clicked.connect(self.apply)
-        reset_btn = QPushButton("Varsayılana dön")
-        reset_btn.clicked.connect(self.reset)
+        clear_btn = QPushButton("Kalibrasyonu sil")
+        clear_btn.clicked.connect(self.clear_all)
         close_btn = QPushButton("Kapat")
         close_btn.clicked.connect(self.reject)
 
         hint = QLabel(
-            "Kamerayı bilinen sıcaklıktaki bir yüzeye tutun\n"
-            "(buzlu su ≈ 0 °C, kaynar su ≈ 100 °C, vücut ≈ 36.5 °C),\n"
-            "gerçek değeri yazıp \"Noktayı ekle\" deyin.\n"
-            "İki nokta birbirinden uzaksa doğruluk artar."
+            "Kamerayı sıcaklığını güvenilir biçimde bildiğiniz mat bir yüzeye tutun\n"
+            "(hedef görüntünün ortasını doldursun), gerçek değeri yazıp\n"
+            "\"Noktayı ekle\" deyin. Kamerayı 5-10 dk ısındırın. Noktalar kaydedilir ve\n"
+            "program açılınca otomatik uygulanır. En az 2 nokta, birbirinden en az 5 °C\n"
+            "uzakta olmalı; tek nokta yalnızca ofset düzeltir. Kızılötesi termometre\n"
+            "referans olarak yetersizdir (±1-2 °C): mümkünse temas termometresi kullanın."
         )
         hint.setWordWrap(True)
 
         form = QFormLayout()
-        form.addRow("İmleçteki değer:", self.live)
+        form.addRow("Kameranın ölçtüğü:", self.live)
         form.addRow("Gerçek sıcaklık:", self.temp)
         form.addRow(add)
 
-        buttons = QHBoxLayout()
-        buttons.addWidget(apply_btn)
-        buttons.addWidget(reset_btn)
-        buttons.addWidget(close_btn)
+        row1 = QHBoxLayout()
+        row1.addWidget(remove)
+        row1.addWidget(clear_btn)
+        row2 = QHBoxLayout()
+        row2.addWidget(apply_btn)
+        row2.addWidget(close_btn)
 
         layout = QVBoxLayout(self)
         layout.addLayout(form)
         layout.addWidget(QLabel("Kalibrasyon noktaları:"))
         layout.addWidget(self.list)
+        layout.addLayout(row1)
         layout.addWidget(hint)
-        layout.addLayout(buttons)
+        layout.addLayout(row2)
 
-        self.result_scale: float | None = None
-        self.result_offset: float | None = None
-
+        self._refresh_list()
         self.timer = QTimer(self)
         self.timer.timeout.connect(self.update_live)
         self.timer.start(250)
         self.update_live()
 
     def update_live(self) -> None:
-        raw = self.raw_getter()
-        if raw is None:
-            self.live.setText("radyometrik veri yok")
-            return
-        t = raw * self.scale + self.offset
-        self.live.setText(f"raw {raw}  →  {t:.1f} °C")
+        t = self.temp_getter()
+        self.live.setText("veri yok" if t is None else f"{t:.2f} °C")
+
+    def _refresh_list(self) -> None:
+        self.points.sort()
+        self.list.clear()
+        for m, t in self.points:
+            self.list.addItem(f"ölçülen {m:6.1f} °C  →  gerçek {t:.1f} °C   ({t - m:+.2f})")
 
     def add_point(self) -> None:
-        raw = self.raw_getter()
-        if raw is None:
-            QMessageBox.information(self, "Kalibrasyon", "Şu anda radyometrik veri yok.")
+        m = self.temp_getter()
+        if m is None:
+            QMessageBox.information(self, "Kalibrasyon", "Şu anda veri yok.")
             return
-        self.points.append((float(raw), float(self.temp.value())))
-        self.list.addItem(f"raw {raw:7.0f}   →   {self.temp.value():.1f} °C")
+        self.points.append((float(m), float(self.temp.value())))
+        self._refresh_list()
+
+    def remove_point(self) -> None:
+        row = self.list.currentRow()
+        if 0 <= row < len(self.points):
+            del self.points[row]
+            self._refresh_list()
 
     def apply(self) -> None:
-        if not self.points:
-            QMessageBox.information(self, "Kalibrasyon", "Önce en az bir nokta ekleyin.")
-            return
-        if len(self.points) == 1:
-            raw, temp = self.points[0]
-            self.result_scale = self.scale
-            self.result_offset = temp - self.scale * raw
-        else:
-            raws = np.array([p[0] for p in self.points])
-            temps = np.array([p[1] for p in self.points])
-            a, b = np.polyfit(raws, temps, 1)
-            self.result_scale = float(a)
-            self.result_offset = float(b)
+        self.result_points = list(self.points)
         self.accept()
 
-    def reset(self) -> None:
-        self.result_scale = DEFAULT_SCALE
-        self.result_offset = DEFAULT_OFFSET
+    def clear_all(self) -> None:
+        self.result_points = []
         self.accept()
 
 
@@ -1360,7 +1497,7 @@ class AboutDialog(QDialog):
             f"<div style='font-size:18px;font-weight:700;color:#ffffff'>ThermalScope "
             f"<span style='font-size:12px;color:#8f8f8f'>v{APP_VERSION}</span></div>"
             "<div style='color:#b9b9b9'>UNI-T / Guide UVC termal kamera görüntüleyici</div>"
-            "<div style='color:#8f8f8f;font-size:11px'>Windows / Linux · Python + PySide6 · ffmpeg (DirectShow / V4L2)</div>"
+            "<div style='color:#8f8f8f;font-size:11px'>Windows / Linux · Python + PySide6 · ffmpeg (DirectShow / V4L2) veya libusb</div>"
         )
         header.addWidget(logo)
         header.addSpacing(8)
@@ -1380,14 +1517,15 @@ class AboutDialog(QDialog):
             "</table>"
             "<hr style='border:0;border-top:1px solid #3a3a46;margin:10px 0'>"
             "<div style='color:#b9b9b9'><b>Nasıl çalışıyor?</b><br>"
-            "Kamera 256×384 YUY2 modunda 16-bit radyometrik veriyi iki 8-bit düzlem olarak gönderir. "
-            "Uygulama üst düzlemi yüksek bayt, alt düzlemi düşük bayt kabul edip ham değeri "
-            "birleştirir; ardından sabit desen/gölge düzeltmesi, sıcak piksel onarımı, hareket "
-            "uyarlamalı gürültü azaltma ve keskinleştirme uygular, ardından seçilen "
-            "renk paletiyle renklendirir.<br><br>"
-            "Sıcaklık, <b>T(°C) = a × ham + b</b> doğrusal modeliyle hesaplanır. Kameranın fabrika "
-            "kalibrasyon eğrisi cihazın içinde çalıştığı için mutlak doğruluk adına "
-            "<b>Kalibrasyon</b> penceresinden 1–2 referans noktası girmeniz önerilir.</div>"
+            "Kamera 256×384 YUY2 akışı gönderir: üst yarı kameranın kendi 8-bit görüntüsü, "
+            "alt yarı ise piksel başına 16-bit sıcaklık verisidir (küçük-endian, Kelvin × 64). "
+            "Uygulama alt yarıyı çözer, sıcak piksel onarımı ve hareket uyarlamalı gürültü "
+            "azaltma uygular; ölçümler yalnızca bu süzülmüş veriden yapılır. Keskinleştirme ve "
+            "detay güçlendirme yalnızca görüntüyü etkiler, sonra seçilen palet uygulanır.<br><br>"
+            "Sıcaklık <b>T(°C) = ham/64 − 273,15</b> ile hesaplanır; fabrika kalibrasyonu "
+            "cihazın içinde yapılır. Bilinen bir referansla fark görürseniz <b>Kalibrasyon</b> "
+            "penceresinden nokta ekleyin: 4 parçalı doğrusal düzeltme kaydedilir ve her açılışta "
+            "otomatik uygulanır.</div>"
             "<div style='color:#7f7f7f;font-size:11px;margin-top:8px'>"
             "Bu uygulama bağımsız bir araçtır; UNI-T / Guide Sensmart ile resmî bağlantısı yoktur.</div>"
         )
@@ -1418,13 +1556,28 @@ class MainWindow(QMainWindow):
         self.resize(1200, 740)
 
         self.settings = Settings.load()
+        if self.settings.decode_v < 2:
+            # Eski sürüm üst yarıdan yüksek bayt alıyordu (yanlış). O çözümlemeyle yapılmış
+            # kalibrasyon noktalarını ve NUC dosyasını at.
+            self.settings.cal_points = []
+            self.settings.decode_v = 2
+            try:
+                self._nuc_file().unlink(missing_ok=True)
+            except Exception:
+                pass
+            self.settings.save()
+        self.settings.scale = DEFAULT_SCALE
+        self.settings.offset = DEFAULT_OFFSET
+        self.cal = PiecewiseCalibration.from_settings(self.settings.cal_points)   # açılışta otomatik
         self.palettes = Palette.load_all(PALETTE_DIR)
         self.palette = next((p for p in self.palettes if p.name == self.settings.palette), self.palettes[0])
         self.agc = AutoGain()
         self.capture: Capture | None = None
         self.ffmpeg = find_ffmpeg(self.settings.ffmpeg)
         self.last_raw: np.ndarray | None = None
-        self.last_temps: np.ndarray | None = None
+        self.last_temps: np.ndarray | None = None   # ölçüm (süzülmüş, kalibre) °C
+        self.last_base: np.ndarray | None = None    # kalibrasyon öncesi °C
+        self.last_disp: np.ndarray | None = None    # ekranda gösterilen (zenginleştirilmiş) °C
         self.spot: tuple[int, int] | None = None
         self._ema: np.ndarray | None = None
         self.nuc: np.ndarray | None = self._load_nuc()
@@ -1461,12 +1614,12 @@ class MainWindow(QMainWindow):
         self.timer.start(40)
 
         self.refresh_devices()
-        if self.ffmpeg is None:
+        if self.device_combo.count() > 0:
+            self.start_capture()
+        elif self.ffmpeg is None:
             QMessageBox.warning(self, "ffmpeg bulunamadı",
                                 ("Görüntü DirectShow" if IS_WIN else "Görüntü V4L2")
                                 + " üzerinden ffmpeg ile alınır.\n" + ffmpeg_missing_hint())
-        elif self.device_combo.count() > 0:
-            self.start_capture()
         else:
             # kamera henüz serbest kalmamış olabilir: kısa aralıklarla yeniden dene
             self._retries_left = 4
@@ -2061,16 +2214,22 @@ class MainWindow(QMainWindow):
     # -- capture --------------------------------------------------------
     def refresh_devices(self) -> None:
         self.device_combo.clear()
-        if self.ffmpeg is None:
-            self.status.setText("ffmpeg bulunamadı.")
-            return
-        devices = list_devices(self.ffmpeg)
+        devices: list[str] = []
+        if self.ffmpeg is not None:
+            devices += list_devices(self.ffmpeg)
+        # doğrudan USB (libusb) girişleri: "usb:VID:PID ..."
+        # libusb ile açık bir akış varken cihaz yeniden açılamaz; o durumda açılabilirlik denetimi atlanır
+        usb_live = UsbCapture is not None and isinstance(self.capture, UsbCapture)
+        devices += [f"usb:{v:04x}:{p:04x} (libusb, {lbl})"
+                    for lbl, v, p in list_uvc_devices(only_openable=not usb_live)]
         for d in devices:
             self.device_combo.addItem(d)
         if devices:
             idx = devices.index(self.settings.device) if self.settings.device in devices else 0
             self.device_combo.setCurrentIndex(idx)
             self.status.setText(f"{len(devices)} kamera bulundu.")
+        elif self.ffmpeg is None:
+            self.status.setText("ffmpeg bulunamadı.")
         else:
             self.status.setText("Kamera bulunamadı. Takıp ⟳ ile yenileyin.")
 
@@ -2081,14 +2240,22 @@ class MainWindow(QMainWindow):
             self.start_capture()
 
     def start_capture(self) -> None:
-        if self.ffmpeg is None:
-            return
         device = self.device_combo.currentText()
         if not device:
             self.status.setText("Önce bir kamera seçin.")
             return
         self.settings.device = device
-        self.capture = Capture(self.ffmpeg, device, self.on_capture_error)
+        if device.startswith("usb:"):
+            if UsbCapture is None:
+                self.status.setText("libusb yolu için: pip install libusb1 (uti_uvc.py ve "
+                                    "uti256_usb.py bu dosyayla aynı klasörde olmalı).")
+                return
+            vid, pid = int(device[4:8], 16), int(device[9:13], 16)
+            self.capture = UsbCapture(vid, pid, self.on_capture_error)
+        else:
+            if self.ffmpeg is None:
+                return
+            self.capture = Capture(self.ffmpeg, device, self.on_capture_error)
         self.capture.start()
         self.start_btn.setText("Durdur")
         self.agc.reset()
@@ -2128,28 +2295,41 @@ class MainWindow(QMainWindow):
         if self.nuc is not None and self.settings.nuc_enabled:
             work = work - self.nuc
 
-        # 1b) hot/dead pixel repair
-        work = despeckle(work, 150.0)
+        # 1b) hot/dead pixel repair (kamera zaten düzeltiyor; eşik geniş tutuldu: 256 sayım ≈ 4 K)
+        work = despeckle(work, 256.0)
 
         # 2) motion-adaptive temporal filter (no smearing, no ghosting)
+        #    gürültü ≈ 5-6 sayım (0.09 K)
         if self.smooth_check.isChecked():
-            self._ema = adaptive_temporal(self._ema, work, sigma=4.0)
+            self._ema = adaptive_temporal(self._ema, work, sigma=6.0)
             work = self._ema
         else:
             self._ema = None
 
-        # 3) light spatial smoothing, then unsharp mask to keep edges crisp
-        if self.smooth_check.isChecked():
-            work = blur3(work)
-        if self.sharpen_check.isChecked():
-            work = unsharp(work, 0.65)
-        work = enhance_detail(work, self.settings.detail)
+        # ÖLÇÜM sinyali: yalnızca zamansal süzme. Yumuşatma/keskinleştirme/detay güçlendirme
+        # kenarlarda sıcaklığı bozar (aşım), bu yüzden okumalar bu sinyalden yapılır.
+        meas = work
 
-        disp = work * scale + offset
+        # 3) GÖRÜNTÜ sinyali: hafif yumuşatma, keskinleştirme, detay (yalnızca renk için)
+        shown = work
+        if self.smooth_check.isChecked():
+            shown = blur3(shown)
+        if self.sharpen_check.isChecked():
+            shown = unsharp(shown, 0.65)
+        shown = enhance_detail(shown, self.settings.detail)
+
+        base = meas * scale + offset                     # kalibrasyon öncesi °C
+        meas_t = self.cal.correct(base)                  # kayıtlı kalibrasyon (açılışta otomatik)
+        disp = self.cal.correct(shown * scale + offset)  # ekran için
 
         # 4) yön: döndürme / ayna (kamera yatay tutulduğunda görüntüyü düzeltir)
-        disp = orient(disp, self.settings.rotation, self.settings.mirror_h, self.settings.mirror_v)
-        self.last_temps = disp
+        rot, mh, mv = self.settings.rotation, self.settings.mirror_h, self.settings.mirror_v
+        self.last_base = orient(base, rot, mh, mv)
+        disp = orient(disp, rot, mh, mv)
+        self.last_disp = disp
+        meas_t = orient(meas_t, rot, mh, mv)
+        self.last_temps = meas_t
+        self.last_raw = orient(raw, rot, mh, mv)
         self.last_raw = orient(raw, self.settings.rotation, self.settings.mirror_h, self.settings.mirror_v)
 
         if self.agc_check.isChecked():
@@ -2171,17 +2351,19 @@ class MainWindow(QMainWindow):
         if self.spot is not None:
             x = int(np.clip(self.spot[0], 0, width - 1))
             y = int(np.clip(self.spot[1], 0, height - 1))
-            spot_text = f"{disp[y, x]:.1f} °C"
+            spot_text = f"{meas_t[y, x]:.1f} °C"
 
         # "16-bit" = kamera verisi (65536 seviye); palet ise renk derinliği (24-bit).
-        mode = "16-bit veri · 65536 seviye"
+        mode = "16-bit radyometrik · Kelvin×64"
+        if self.cal.active:
+            mode += f" · kal. {len(self.cal.points)} nokta"
         if self.nuc is not None and self.settings.nuc_enabled:
             mode += " · NUC"
         if self.settings.rotation:
             mode += f" · {self.settings.rotation}°"
         self.view.set_frame(rgb, spot_text, mode)
         self.view.set_scale(self.palette.lut, lo, hi)
-        self.update_stats(disp, spot_text)
+        self.update_stats(meas_t, spot_text)
 
     def update_stats(self, temps: np.ndarray, spot_text: str) -> None:
         self.spot_label.setText(spot_text or "--.- °C")
@@ -2204,7 +2386,8 @@ class MainWindow(QMainWindow):
             return
         self.status.setText(
             f"{width}x{height} · {fps:.0f} fps · veri 16-bit, palet 24-bit\n"
-            f"T(°C) = {self.settings.scale:.8f} × raw + {self.settings.offset:.4f}"
+            f"T(°C) = ham/64 − 273.15 · "
+            + (f"kalibrasyon: {len(self.cal.points)} nokta" if self.cal.active else "kalibrasyon yok")
         )
 
     # -- events ---------------------------------------------------------
@@ -2362,22 +2545,27 @@ class MainWindow(QMainWindow):
         self.status.setText("NUC silindi.")
 
     def open_calibration(self) -> None:
-        def raw_getter():
-            if self.last_raw is None:
+        def temp_getter():
+            base = self.last_base
+            if base is None:
                 return None
-            height, width = self.last_raw.shape
+            height, width = base.shape
             if self.spot is not None:
-                x = int(np.clip(self.spot[0], 0, width - 1))
-                y = int(np.clip(self.spot[1], 0, height - 1))
-                return int(self.last_raw[y, x])
-            return int(self.last_raw[height // 2, width // 2])
+                cx = int(np.clip(self.spot[0], 0, width - 1))
+                cy = int(np.clip(self.spot[1], 0, height - 1))
+            else:
+                cx, cy = width // 2, height // 2
+            win = base[max(cy - 2, 0):cy + 3, max(cx - 2, 0):cx + 3]
+            return float(win.mean())      # 5x5 ortalama, kalibrasyon ÖNCESİ değer
 
-        dlg = CalibrationDialog(self, self.settings.scale, self.settings.offset, raw_getter)
-        if dlg.exec() == QDialog.Accepted and dlg.result_scale is not None:
-            self.settings.scale = dlg.result_scale
-            self.settings.offset = dlg.result_offset
+        dlg = CalibrationDialog(self, self.cal.points, temp_getter)
+        if dlg.exec() == QDialog.Accepted and dlg.result_points is not None:
+            self.cal.set_points(dlg.result_points)
+            self.settings.cal_points = self.cal.to_settings()
             self.settings.save()
+            self._ema = None
             self.agc.reset()
+            self._flash(self.cal.describe())
 
     # -- video kaydı ----------------------------------------------------
     def _flash(self, message: str, seconds: float = 6.0) -> None:
@@ -2457,7 +2645,8 @@ class MainWindow(QMainWindow):
         if self.last_temps is None:
             return
         lo, hi = (self.agc.lo, self.agc.hi) if self.agc_check.isChecked() else (self.min_spin.value(), self.max_spin.value())
-        idx = celsius_to_index(self.last_temps, lo, hi)
+        src = self.last_disp if self.last_disp is not None else self.last_temps
+        idx = celsius_to_index(src, lo, hi)
         idx = apply_contrast(idx, self.settings.contrast)
         if self.shading_check.isChecked():
             idx = fix_shading(idx)
