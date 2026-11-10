@@ -68,7 +68,10 @@ APP_AUTHOR = "efek0349"
 GITHUB_URL = "https://github.com/efek0349"
 TELEGRAM_URL = "https://t.me/efek0349"
 GPG_KEY = "0x2BE4D2A863E2EAB4"
-BASE_DIR = Path(__file__).resolve().parent
+FROZEN = bool(getattr(sys, "frozen", False))     # PyInstaller tek dosya (onefile) modu
+# Tek dosyada kaynaklar (palettes/, ffmpeg) çalışma anında geçici klasöre (sys._MEIPASS) açılır.
+BASE_DIR = Path(getattr(sys, "_MEIPASS", Path(sys.executable).parent)) if FROZEN \
+    else Path(__file__).resolve().parent
 PALETTE_DIR = BASE_DIR / "palettes"
 IS_WIN = os.name == "nt"
 UI_FONT = "Segoe UI" if IS_WIN else "Sans Serif"
@@ -328,14 +331,20 @@ def install_desktop_entry() -> Path:
     apps = Path(base) / "applications"
     apps.mkdir(parents=True, exist_ok=True)
     target = apps / "thermalscope.desktop"
-    script = Path(__file__).resolve()
+    if FROZEN:
+        exec_line = f'Exec="{sys.executable}"\n'
+        workdir = Path(sys.executable).resolve().parent
+    else:
+        script = Path(__file__).resolve()
+        exec_line = f'Exec="{sys.executable}" "{script}"\n'
+        workdir = script.parent
     target.write_text(
         "[Desktop Entry]\n"
         "Type=Application\n"
         f"Name={APP_NAME}\n"
         "Comment=UNI-T / Guide termal kamera görüntüleyici\n"
-        f'Exec="{sys.executable}" "{script}"\n'
-        f"Path={script.parent}\n"
+        + exec_line +
+        f"Path={workdir}\n"
         f"Icon={icon}\n"
         "Terminal=false\n"
         "Categories=Graphics;Video;Utility;\n"
@@ -595,6 +604,8 @@ def find_ffmpeg(configured: str = "") -> str | None:
     candidates: list[str] = []
     if configured:
         candidates.append(configured)
+    if FROZEN:                                   # pakete gömülü ffmpeg öncelikli
+        candidates.append(str(BASE_DIR / exe))
     found = shutil.which("ffmpeg")
     if found:
         candidates.append(found)

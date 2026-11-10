@@ -1,0 +1,5 @@
+# Tek dosya (onefile) derleme bağımlılıkları:  pip install -r requirements-build.txt
+PySide6>=6.5
+numpy>=1.23
+pyinstaller>=6.6
+libusb1>=3.0        # isteğe bağlı: doğrudan USB yolu
