@@ -1,0 +1,12 @@
+# Derleme çıktıları - git'e girmez (GitHub 100 MB sınırı); Releases'e yüklenir
+dist/
+build/
+vendor/
+*.spec
+ThermalScope-Linux64
+ThermalScope-Win64.exe
+ThermalScope.exe
+__pycache__/
+.venv/
+smoke*.png
+smoke_state.txt
